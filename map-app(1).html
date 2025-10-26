@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>積淹水地圖</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+<style>
+    #map { height: 600px; width: 100%; }
+    body { margin: 0; padding: 0; }
+    #controls { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000; background: white; padding: 10px; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.3); display: flex; align-items: center; }
+    #controls input { margin: 5px; width: 200px; padding: 5px; }
+    #controls button { margin: 5px; padding: 5px 10px; cursor: pointer; }
+    #status { position: absolute; top: 60px; left: 50%; transform: translateX(-50%); z-index: 1000; background: white; padding: 10px; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.3); width: 300px; text-align: center; }
+    
+    #controlPanel {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 10px;
+    padding: 10px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    z-index: 1001;
+   }
+
+   #controlPanel input, #controlPanel button {
+    margin: 4px 0;
+    width: 240px;
+  }
+</style>
+</head>
+<body>
+<div id="controls">
+    <input type="text" id="start" placeholder="起點地址" />
+    <input type="text" id="end" placeholder="終點地址" />
+    <button onclick="startRouting()">開始導航</button>
+    <button onclick="startSimulation()" id="simulateBtn" disabled>開始模擬</button>
+    <button id="setStartMapBtn">點擊地圖設定 起點</button>
+    <button id="setEndMapBtn">點擊地圖設定 終點</button>
+    <button id="useOsrmRouteBtn" onclick="useOsrmRoute()" disabled>使用 OSRM 路線</button>
+    <label><input type="checkbox" id="avoidHighway"> 避開高速</label>
+    <label><input type="checkbox" id="avoidToll"> 避開收費</label>
+    <button id="clearStartBtn">清除起點</button>
+    
+</div>
+<div id="status">等待輸入地址...</div>
+<div id="map"></div>
+<div id="routePanel">
+<div id="routeInfo"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+
+
+
+<script>
+//const HERE_API_KEY="VShLKrWkKcun4Stw5Q48zHO6jMhYI4h50tj6rTzuEDQ"
+// 建立 RoutingService
+//const platform = new H.service.Platform({ apikey: HERE_API_KEY });
+//const router = platform.getRoutingService(null, 8); // 8代表使用v8 Routing API
+const map = L.map('map').setView([23.7, 120.9], 7);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'© OpenStreetMap', maxZoom:19 }).addTo(map);
+
+let userMarker=null, destinationMarker=null, routingLine=null;
+let userLocation = {}; 
+let destinationCoords = {};
+let routeCoordinates = [];
+let simulationIndex=0, simulationInterval=null;
+
+let osrmRouteCoordinates = [];
+//let osrmRoutingLine = null;
+let routeLayer = null;
+let routeDeleteBtn = null;
+//let sharedMarkerStart = null;
+//let sharedMarkerEnd = null;
+
+// 用來存放目前的 marker
+let startMarker = null;
+
+// 監聽起點輸入框按下 Enter 或失去焦點
+document.getElementById('start').addEventListener('change', async function(e) {
+    if (e.key !== "Enter") return;
+    let address = this.value.trim();
+    if (!address) return;
+
+    // 先清除舊 marker
+    if (startMarker) {
+        startMarker.remove();
+        startMarker = null;
+    }
+});
+
+document.getElementById('clearStartBtn').addEventListener('click', function() {
+    if (startMarker) startMarker.remove();
+    startMarker = null;
+    document.getElementById('start').value = '';
+});
+
+
+function drawRoute(coords) {
+    if (routeLayer) {
+        map.removeLayer(routeLayer);
+        routeLayer = null;
+    }
+    if (routeDeleteBtn) {
+        routeDeleteBtn.remove();
+        routeDeleteBtn = null;
+    }
+
+    routeLayer = L.polyline(coords, { color: 'blue', weight: 5 }).addTo(map);
+    map.fitBounds(routeLayer.getBounds());
+
+    // 浮動刪除按鈕
+    let center = routeLayer.getBounds().getCenter();
+    let pt = map.latLngToContainerPoint(center);
+    routeDeleteBtn = document.createElement('button');
+    routeDeleteBtn.innerHTML = '×';
+    routeDeleteBtn.className = 'delete-route-btn';
+    routeDeleteBtn.style.left = (pt.x - 14) + 'px';
+    routeDeleteBtn.style.top = (pt.y - 14) + 'px';
+    document.body.appendChild(routeDeleteBtn);
+
+    routeDeleteBtn.onclick = () => {
+        map.removeLayer(routeLayer);
+        routeLayer = null;
+        routeDeleteBtn.remove();
+        routeDeleteBtn = null;
+        document.getElementById('routeInfo').innerHTML = '';
+    };
+
+    // --- 放在這裡監聽地圖縮放與移動，讓刪除按鈕跟隨 ---
+    map.on('zoom move', () => {
+        if (routeLayer && routeDeleteBtn) {
+            const center = routeLayer.getBounds().getCenter();
+            const pt = map.latLngToContainerPoint(center);
+            routeDeleteBtn.style.left = (pt.x - 14) + 'px';
+            routeDeleteBtn.style.top = (pt.y - 14) + 'px';
+        }
+    });
+    
+}
+
+// --- 新增：整合 OSRM Routing Machine 控制器 ---
+let osrmControl = L.Routing.control({
+    waypoints: [
+        //L.latLng(userLocation.lat || userLocation[0], userLocation.lng || userLocation[1]),
+        //L.latLng(destinationCoords.lat || destinationCoords[0], destinationCoords.lng || destinationCoords[1])
+    ],
+    router: L.Routing.osrmv1({
+        serviceUrl: 'https://router.project-osrm.org/route/v1',
+        profile: 'car' // 預設為汽車，可手動切換
+    }),
+    lineOptions: {
+        styles: [{ color: 'green', weight: 5, opacity: 0.7 }]
+    },
+    showAlternatives: true,
+    altLineOptions: { styles: [{ color: 'gray', opacity: 0.5 }] },
+    addWaypoints: true,
+    routeWhileDragging: true,
+    draggableWaypoints: true,
+    collapsible: true
+}).addTo(map);
+
+
+osrmControl.on('routesfound', function(e){
+    const r = e.routes[0];
+    if(r && r.coordinates){
+        osrmRouteCoordinates = r.coordinates.map(c => ({ lat: c.lat, lng: c.lng }));
+        if(routingLine) map.removeLayer(routingLine);
+        routingLine = L.polyline(osrmRouteCoordinates, { color: 'green', weight: 6, opacity: 0.8 }).addTo(map);
+        map.fitBounds(routingLine.getBounds());
+        document.getElementById('simulateBtn').disabled = false;
+        document.getElementById('useOsrmRouteBtn').disabled = false;
+        // 顯示距離（若有 summary）
+        const dist = r.summary && r.summary.totalDistance ? (r.summary.totalDistance/1000).toFixed(2) : 'N/A';
+        document.getElementById('status').innerText = `路線計算完成，總距離：約 ${dist} km`;
+        loadAddressesAndMark(); // 計算完成後自動標記 MongoDB 地址
+    }
+});
+osrmControl.on('routingerror', function(err){ console.warn('OSRM routing error', err); });
+
+
+// 點擊地圖設定起點/終點模式
+let awaitingMapClick = null; // 'start' | 'end' | null
+
+document.getElementById('setStartMapBtn').addEventListener('click', ()=>{
+    awaitingMapClick='start';
+    setStartMapBtn.textContent='請於地圖點擊起點...';
+});
+document.getElementById('setEndMapBtn').addEventListener('click', ()=>{
+    awaitingMapClick='end';
+    setEndMapBtn.textContent='請於地圖點擊終點...';
+});
+
+
+map.on('click', async function(e){
+    if(!awaitingMapClick) return;
+    const lat = e.latlng.lat, lng = e.latlng.lng;
+
+    if(awaitingMapClick === 'start'){
+        userLocation = { lat, lng };
+        if(!startMarker) startMarker = L.marker([lat,lng]).addTo(map);
+        else startMarker.setLatLng([lat,lng]);
+        document.getElementById('start').value = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+    } else if(awaitingMapClick === 'end'){
+        destinationCoords = { lat, lng };
+        if(!destinationMarker) destinationMarker = L.marker([lat,lng]).addTo(map);
+        else destinationMarker.setLatLng([lat,lng]);
+        document.getElementById('end').value = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+        setEndMapBtn.textContent = '點擊地圖設定 終點';
+    }
+
+    awaitingMapClick = null;
+    
+    // 即時更新 OSRM 預覽
+    if(userLocation.lat && destinationCoords.lat){
+        try {
+            osrmControl.setWaypoints([
+                L.latLng(userLocation.lat, userLocation.lng),
+                L.latLng(destinationCoords.lat, destinationCoords.lng)
+            ]);
+            osrmControl.route();
+        } catch(e){
+            console.warn('更新 OSRM waypoints 失敗', e);
+        }
+    }
+
+    
+});
+
+
+
+// --- **修改：從 MongoDB 取得地址並轉成坐標
+async function loadAddressesAndMark(){
+    const statusDiv = document.getElementById('status');
+    statusDiv.innerHTML = '讀取 MongoDB 資料中...';
+
+    try{
+        // 從後端 API 取得 MongoDB 地址，假設返回格式 [{address:'台北101', num_objects:1}, ...]
+        const res = await fetch('/api/addresses');  
+        const data = await res.json();
+        console.log("data:",data);
+
+        // **修改：篩選 num_objects != 0**
+        //const filteredData = data.filter(item => item.num_objects !== 0);
+
+        let usedRouteCoords = (osrmRouteCoordinates && osrmRouteCoordinates.length) ? osrmRouteCoordinates : null;
+        if (!usedRouteCoords) {
+            statusDiv.innerHTML = '尚未計算路線，無法標記地址';
+            return;
+        }
+
+    
+
+        for (const item of data) {
+            const lat = item.lat || item.latitude;
+            const lng = item.lng || item.longitude;
+            if (!lat || !lng) continue;
+
+            L.marker([lat, lng])
+                .addTo(map)
+                .bindPopup(`${item.street || '未知地點'}<br>num_objects: ${item.num_objects || 0}`);
+
+            // --- 新增：生成 300 公尺圓形並沿邊取點畫線段 ---
+            const circleRadius = 0.3; // km
+            const numPoints = 36; // 圓上取 36 個點
+            const earthRadius = 6371; // km
+            const latRad = lat * Math.PI/180;
+            const lngRad = lng * Math.PI/180;
+            const coords = [];
+
+            for(let i=0; i<numPoints; i++){
+                const angle = (i/numPoints) * 2 * Math.PI;
+                const dLat = (circleRadius/earthRadius) * Math.cos(angle);
+                const dLng = (circleRadius/earthRadius) * Math.sin(angle) / Math.cos(latRad);
+                const pointLat = lat + dLat * 180/Math.PI;
+                const pointLng = lng + dLng * 180/Math.PI;
+                coords.push([pointLat, pointLng]);
+            }
+
+            // 畫紅色線段
+            L.polyline(coords, { color: 'red', weight: 3, opacity: 0.8 }).addTo(map);
+        }
+
+        // 輔助：計算點到線段距離 (Haversine)
+        function distancePointToSegment(p, v, w){
+            // p, v, w = {lat, lng} 或 [lat, lng]
+            const toLatLng = x => Array.isArray(x) ? {lat:x[0], lng:x[1]} : x;
+            p = toLatLng(p); v = toLatLng(v); w = toLatLng(w);
+
+            const R = 6371; // km
+            const d2 = (lat1,lng1,lat2,lng2)=>{
+                const dLat=(lat2-lat1)*Math.PI/180;
+                const dLon=(lng2-lng1)*Math.PI/180;
+                const a=Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+                return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+            };
+
+            const l2 = d2(v.lat, v.lng, w.lat, w.lng);
+            if(l2 === 0) return d2(p.lat,p.lng,v.lat,v.lng);
+
+            // 投影比例
+            let t = ((p.lat - v.lat)*(w.lat - v.lat) + (p.lng - v.lng)*(w.lng - v.lng)) / ((w.lat - v.lat)**2 + (w.lng - v.lng)**2);
+            t = Math.max(0, Math.min(1, t));
+            const proj = {lat: v.lat + t*(w.lat - v.lat), lng: v.lng + t*(w.lng - v.lng)};
+            return d2(p.lat,p.lng,proj.lat,proj.lng);
+        }
+
+
+        const coords = data
+            .filter(d => (d.lat || d.latitude) && (d.lng || d.longitude))
+            .map(d => [d.lat || d.latitude, d.lng || d.longitude]);
+
+        if (coords.length > 1) {
+            map.fitBounds(coords);
+        }
+
+
+        statusDiv.innerHTML = '已標記所有地址及附近路段';
+
+    }catch(err){ console.error(err); statusDiv.innerHTML='讀取或標記失敗'; }
+}
+
+// --- **修改：頁面載入後自動呼叫**
+window.onload = async function(){
+    //await startRouting();
+    await loadAddressesAndMark(); // **修改：自動標記 MongoDB 地址**
+    fetch("/api/flood_roads")
+      .then(res => res.json())
+      .then(data => {
+          data.forEach(item => {
+              item.roads.forEach(feat => {
+                  const coords = feat.geometry.coordinates.map(c => [c[1], c[0]]);
+                  L.polyline(coords, { color: "red", weight: 3 }).addTo(map);
+              });
+          });
+      })
+      .catch(err => console.error("載入紅線段失敗:", err));
+};
+
+
+
+// --- 模式切換 (Car/Bike/Foot) ---
+const profileSelector = L.DomUtil.create('select', 'leaflet-bar leaflet-control leaflet-routing-select-profile');
+['car', 'bike', 'foot'].forEach(mode => {
+    const opt = document.createElement('option');
+    opt.value = mode;
+    opt.text = mode.charAt(0).toUpperCase() + mode.slice(1);
+    profileSelector.appendChild(opt);
+});
+profileSelector.onchange = function () {
+    const mode = this.value;
+    osrmControl.getRouter().options.profile = mode;
+    osrmControl.route(); // 重新規劃
+};
+
+// 將模式切換按鈕加到地圖右上角
+const customControl = L.control({ position: 'topright' });
+customControl.onAdd = function () {
+    const div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    div.style.background = 'white';
+    div.style.padding = '4px';
+    div.appendChild(profileSelector);
+    return div;
+};
+customControl.addTo(map);
+
+
+
+// 輔助函數：計算兩點距離
+function calculateDistance(lat1, lon1, lat2, lon2){
+    const R=6371, dLat=(lat2-lat1)*Math.PI/180, dLon=(lon2-lon1)*Math.PI/180;
+    const a=Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+
+
+
+// 獲取使用者位置
+if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(pos=>{
+        userLocation={lat:pos.coords.latitude, lng:pos.coords.longitude};
+        map.setView([userLocation.lat, userLocation.lng], 15);
+        userMarker=L.marker([userLocation.lat,userLocation.lng]).addTo(map)
+            .bindPopup('你的位置').openPopup();
+        try{ osrmControl.setWaypoints([ L.latLng(userLocation.lat, userLocation.lng), L.latLng(destinationCoords.lat || destinationCoords[0], destinationCoords.lng || destinationCoords[1]) ]); osrmControl.route(); }catch(e){}
+    }, ()=>{ 
+        userLocation={lat:25.0338,lng:121.5651}; map.setView([25.0338,121.5651],12);
+        userMarker=L.marker([25.0338,121.5651]).addTo(map).bindPopup('台北101').openPopup();
+    });
+}
+
+
+// 開始導航
+async function startRouting() {
+    const startAddr = document.getElementById('start').value.trim();
+    const endAddr = document.getElementById('end').value.trim();
+    const statusDiv = document.getElementById('status');
+    if (!startAddr || !endAddr) { 
+        alert('請輸入起點與終點地址'); 
+        return; 
+    }
+
+    statusDiv.innerHTML = '解析地址中...';
+
+    try {
+        // geocode 地址（支援經緯度或文字地址）
+        const geocodeAddress = async (addr) => {
+            const coordMatch = addr.match(/^\s*([+-]?\d+(\.\d+)?)\s*,\s*([+-]?\d+(\.\d+)?)\s*$/);
+            if (coordMatch) {
+                return { lat: parseFloat(coordMatch[1]), lng: parseFloat(coordMatch[3]) };
+            }
+            // 使用 Nominatim geocoding
+            const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addr)}`);
+            const data = await res.json();
+            if (!data || !data.length) return null;
+            // 注意：Nominatim 回傳是 { lat, lon }
+            return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+        };
+
+        const startPos = await geocodeAddress(startAddr);
+        const endPos = await geocodeAddress(endAddr);
+
+        if (!startPos) throw new Error("起點地址解析失敗");
+        if (!endPos) throw new Error("終點地址解析失敗");
+
+        userLocation = startPos;
+        destinationCoords = endPos;
+
+        // 標記起點/終點
+        if (!userMarker) {
+            userMarker = L.marker([startPos.lat, startPos.lng]).addTo(map).bindPopup('起點').openPopup();
+        } else {
+            userMarker.setLatLng([startPos.lat, startPos.lng]).bindPopup('起點').openPopup();
+        }
+
+        if (!destinationMarker) {
+            destinationMarker = L.marker([endPos.lat, endPos.lng]).addTo(map).bindPopup('終點').openPopup();
+        } else {
+            destinationMarker.setLatLng([endPos.lat, endPos.lng]).bindPopup('終點').openPopup();
+        }
+
+        // 更新 OSRM Waypoints
+        osrmControl.setWaypoints([
+            L.latLng(startPos.lat, startPos.lng),
+            L.latLng(endPos.lat, endPos.lng)
+        ]);
+
+        // 立即計算路線
+        osrmControl.route();
+
+        // 等待 routesfound 事件
+        osrmControl.on('routesfound', function(e) {
+            const r = e.routes[0];
+            if (r && r.coordinates) {
+                routeCoordinates = r.coordinates.map(c => ({ lat: c.lat, lng: c.lng }));
+
+                // 畫路線
+                if (routingLine) map.removeLayer(routingLine);
+                routingLine = L.polyline(routeCoordinates, { color: 'green', weight: 6, opacity: 0.85 }).addTo(map);
+                map.fitBounds(routingLine.getBounds());
+
+                const totalDistance = (r.summary.totalDistance / 1000).toFixed(2);
+                const totalDuration = Math.round(r.summary.totalTime / 60);
+                statusDiv.innerHTML = `導航成功！<br>距離：${totalDistance} km<br>時間：${totalDuration} 分鐘`;
+                document.getElementById('simulateBtn').disabled = false;
+                simulationIndex = 0;
+
+                // 自動標記 MongoDB 地址
+                loadAddressesAndMark();
+            }
+        });
+
+        osrmControl.on('routingerror', function(err) {
+            console.warn('OSRM routing error', err);
+            statusDiv.innerHTML = '路線計算失敗';
+        });
+
+    } catch (err) {
+        console.error(err);
+        statusDiv.innerHTML = '計算路線失敗';
+    }
+}
+
+
+// 模擬移動
+function startSimulation(){
+    if(!osrmRouteCoordinates.length){ alert('請先計算路線'); return; }
+    const btn=document.getElementById('simulateBtn');
+
+    if(simulationInterval){
+        clearInterval(simulationInterval);
+        simulationInterval=null;
+        btn.textContent='開始模擬';
+        return;
+    }
+
+    btn.textContent='停止模擬';
+    simulationIndex=0;
+    simulationInterval=setInterval(()=>{
+        if(simulationIndex>=osrmRouteCoordinates.length){
+            clearInterval(simulationInterval);
+            simulationInterval=null;
+            btn.textContent='開始模擬';
+            return;
+        }
+        const pos=osrmRouteCoordinates[simulationIndex];
+        if(!userMarker){
+            userMarker=L.marker([pos.lat,pos.lng]).addTo(map).bindPopup('模擬位置').openPopup();
+        }else{
+            userMarker.setLatLng([pos.lat,pos.lng]);
+        }
+
+        map.panTo([pos.lat,pos.lng]);
+        simulationIndex++;
+    },500);
+    
+}
+
+function useOsrmRoute(){
+    if(!osrmRouteCoordinates || !osrmRouteCoordinates.length){
+        alert('尚無 OSRM 路線可用');
+        return;
+    }
+    routeCoordinates = osrmRouteCoordinates.map(p => ({ lat: p.lat, lng: p.lng }));
+    if(routingLine) map.removeLayer(routingLine);
+    routingLine = L.polyline(routeCoordinates,{color:'green',weight:6,opacity:0.85}).addTo(map);
+    map.fitBounds(routingLine.getBounds());
+    document.getElementById('simulateBtn').disabled = false;
+    simulationIndex = 0;
+    document.getElementById('status').innerHTML = '已使用 OSRM 路線作為模擬路線';
+}
+
+</script>
+</body>
+</html>
